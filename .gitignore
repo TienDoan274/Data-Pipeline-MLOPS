@@ -1,0 +1,164 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# ==================== AIRFLOW ====================
+# Airflow logs (keep structure but ignore content)
+logs/**/*.log
+logs/**/attempt=*.log
+
+# Airflow database
+airflow.db
+airflow.cfg
+webserver_config.py
+
+# ==================== DATA & STORAGE ====================
+# Data files (bronze/silver/gold layers)
+data/bronze/**
+data/silver/**
+data/gold/**
+!data/bronze/.gitkeep
+!data/silver/.gitkeep
+!data/gold/.gitkeep
+
+# Parquet files
+*.parquet
+
+# Trino metastore data
+trino/metastore/**
+!trino/metastore/.gitkeep
+
+# ==================== DOCKER & INFRASTRUCTURE ====================
+# Docker volumes data
+*-data/
+postgres-data/
+mysql-data/
+redis-data/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Docker override
+docker-compose.override.yml
+
+# ==================== CREDENTIALS & SECRETS ====================
+# Sensitive files
+*.pem
+*.key
+*.cert
+credentials.json
+secrets.yaml
+
+# API Keys
+telegram_config.json
+
+# Database dumps
+*.sql
+*.dump
+
+# ==================== MACHINE LEARNING ====================
+# Model artifacts
+*.pkl
+*.joblib
+*.h5
+*.pb
+*.onnx
+models/
+checkpoints/
+wandb/
+
+# WandB local data
+wandb-data/
+wandb-mysql-data/
+
+# ==================== MONITORING & TESTING ====================
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# Testing
+.pytest_cache/
+.tox/
+
+# ==================== OS GENERATED ====================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.nfs*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ==================== TEMPORARY FILES ====================
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# ==================== PROJECT SPECIFIC ====================
+# Config (if contains secrets)
+config/secrets.yaml
+config/local_settings.py
+
+# Init scripts with sensitive data
+init-scripts/*.sql
+
+# Flink checkpoints (keep structure)
+flink-checkpoints/**
+!flink-checkpoints/.gitkeep
+
+# Test files
+test.py
+test.ipynb
+scratch.ipynb

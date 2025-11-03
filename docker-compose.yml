@@ -1,0 +1,531 @@
+# docker-compose.yml
+version: '3.8'
+
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.9.2}
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # MinIO connection
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+    AWS_ENDPOINT_URL: http://minio:9000
+    # Source DB connection (for DAGs to use)
+    SOURCE_DB_HOST: source-postgres
+    SOURCE_DB_PORT: 5432
+    SOURCE_DB_NAME: ecommerce
+    SOURCE_DB_USER: app_user
+    SOURCE_DB_PASSWORD: app_password
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data 
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    airflow-postgres:
+      condition: service_healthy
+
+services:
+  # ==================== AIRFLOW METADATA DATABASE ====================
+  airflow-postgres:
+    image: postgres:13
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-postgres-db:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"  # External port để debug (optional)
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - airflow-network
+
+  # ==================== SOURCE SYSTEM DATABASE (E-commerce Backend) ====================
+  source-postgres:
+    image: postgres:13
+    container_name: source-postgres
+    environment:
+      POSTGRES_USER: app_user
+      POSTGRES_PASSWORD: app_password
+      POSTGRES_DB: ecommerce
+    volumes:
+      - source-postgres-db:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d  # Init scripts
+    ports:
+      - "5434:5432"  # External port để có thể connect trực tiếp
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "app_user", "-d", "ecommerce"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - airflow-network
+    # Resource limits (giống production)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  # ==================== AIRFLOW SERVICES ====================
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - airflow-network
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - airflow-network
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
+        exec su airflow -c "/entrypoint airflow version"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: 'boto3 s3fs sqlalchemy psycopg2-binary pyarrow pandas'
+    user: "0:0"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}:/sources
+    networks:
+      - airflow-network
+
+  # ==================== MINIO (Data Lake) ====================
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: always
+    networks:
+      - airflow-network
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb myminio/bronze --ignore-existing;
+      /usr/bin/mc mb myminio/silver --ignore-existing;
+      /usr/bin/mc mb myminio/gold --ignore-existing;
+      /usr/bin/mc mb myminio/trino --ignore-existing;
+      /usr/bin/mc policy set download myminio/bronze;
+      /usr/bin/mc policy set download myminio/silver;
+      /usr/bin/mc policy set download myminio/gold;
+      echo 'MinIO buckets created successfully';
+      "
+    networks:
+      - airflow-network
+
+  # ==================== TRINO (Query Engine) ====================
+  trino:
+    image: trinodb/trino:435
+    container_name: trino
+    user: "1000:1000"
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog
+      - ./trino/metastore:/var/trino/metastore
+    depends_on:
+      - minio
+    restart: always
+    networks:
+      - airflow-network
+
+  # real time fraud detection
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - airflow-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # Zookeeper
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - airflow-network
+    restart: always
+
+  # Kafka
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - airflow-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Kafka UI
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "9080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - airflow-network
+    restart: always
+
+  # Debezium
+  debezium:
+    image: debezium/connect:2.5
+    container_name: debezium
+    depends_on:
+      kafka:
+        condition: service_healthy
+      source-postgres:
+        condition: service_started
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: debezium_configs
+      OFFSET_STORAGE_TOPIC: debezium_offsets
+      STATUS_STORAGE_TOPIC: debezium_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+    networks:
+      - airflow-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      # MinIO connection
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      # Redis connection
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Trino connection
+      TRINO_HOST: trino
+      TRINO_PORT: 8080
+    volumes:
+      - ./dashboard:/app
+    depends_on:
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - airflow-network
+    restart: always
+
+  flink-jobmanager:
+    build:
+      context: ./flink  # ← Build only from flink directory
+    container_name: flink-jobmanager
+    command: jobmanager
+    ports:
+      - "8082:8081"
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        parallelism.default: 2
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        state.backend.incremental: true
+    volumes:
+      - ./flink-jobs:/opt/flink/jobs:ro  # ← Mount jobs directory
+      - flink-checkpoints:/tmp/flink-checkpoints
+    networks:
+      - airflow-network
+    restart: always
+
+  flink-taskmanager:
+    build:
+      context: ./flink  # ← Same
+    container_name: flink-taskmanager
+    command: taskmanager
+    depends_on:
+      - flink-jobmanager
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: rocksdb
+        state.backend.incremental: true
+    volumes:
+      - ./flink-jobs:/opt/flink/jobs:ro  # ← Mount jobs directory
+      - flink-checkpoints:/tmp/flink-checkpoints
+    networks:
+      - airflow-network
+    restart: always
+  
+  # ==================== WANDB SELF-HOSTED STACK (NEW) ====================
+  
+  # WandB Database
+  wandb-mysql:
+    image: mysql:8.0
+    container_name: wandb-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: wandb_root_pass
+      MYSQL_DATABASE: wandb_local
+      MYSQL_USER: wandb
+      MYSQL_PASSWORD: wandb_pass
+    volumes:
+      - wandb-mysql-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "wandb", "-pwandb_pass"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: always
+    networks:
+      - airflow-network
+    command: --default-authentication-plugin=mysql_native_password
+
+  # WandB Server
+  wandb-server:
+    image: wandb/local:latest
+    container_name: wandb-server
+    ports:
+      - "8084:8080"  # WandB UI (avoiding conflict with Airflow 8080)
+    environment:
+      # Database connection
+      MYSQL_HOST: wandb-mysql
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: wandb_local
+      MYSQL_USER: wandb
+      MYSQL_PASSWORD: wandb_pass
+      
+      # Storage backend (MinIO)
+      AWS_REGION: us-east-2
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      BUCKET: s3://wandb
+      BUCKET_QUEUE: internal://
+      
+      # S3 endpoint (MinIO)
+      AWS_ENDPOINT_URL: http://minio:9000
+      
+      # WandB settings
+      LICENSE: eyJhbGciOiJSUzI1NiIsImtpZCI6InUzaHgyQjQyQWhEUXM1M0xQY09yNnZhaTdoSlduYnF1bTRZTlZWd1VwSWM9In0.eyJjb25jdXJyZW50QWdlbnRzIjoxMCwidHJpYWwiOnRydWUsIm1heFN0b3JhZ2VHYiI6MTAwMDAwMCwibWF4VGVhbXMiOjUwLCJtYXhVc2VycyI6MTAwLCJtYXhWaWV3T25seVVzZXJzIjowLCJtYXhSZWdpc3RlcmVkTW9kZWxzIjo1LCJleHBpcmVzQXQiOiIyMDI1LTExLTMwVDA0OjM0OjQ4LjYwOFoiLCJkZXBsb3ltZW50SWQiOiIxMmNmYWM5NC0wY2QwLTQ2Y2ItODQ4Zi00OWRhNzk3N2RhMDQiLCJmbGFncyI6WyJOT1RJRklDQVRJT05TIiwic2xhY2siLCJub3RpZmljYXRpb25zIiwiU0NBTEFCTEUiLCJteXNxbCIsInMzIiwicmVkaXMiLCJNQU5BR0VNRU5UIiwib3JnX2Rhc2giLCJhdXRoMCIsImNvbGxlY3RfYXVkaXRfbG9ncyIsInJiYWMiXSwiY29udHJhY3RTdGFydERhdGUiOiIyMDI1LTEwLTMxVDA0OjM0OjQ4LjYxM1oiLCJhY2Nlc3NLZXkiOiI1YTA2ZWFhYi05ZjgzLTRkYWMtOThhOC1jZmFmNDE5MGY3M2IiLCJzZWF0cyI6MTAwLCJ2aWV3T25seVNlYXRzIjowLCJ0ZWFtcyI6NTAsInJlZ2lzdGVyZWRNb2RlbHMiOjUsInN0b3JhZ2VHaWdzIjoxMDAwMDAwLCJleHAiOjE3NjQ0NzcyODgsIndlYXZlTGltaXRzIjp7IndlYXZlTGltaXRCeXRlcyI6bnVsbCwid2VhdmVPdmVyYWdlQ29zdENlbnRzIjowLCJ3ZWF2ZU92ZXJhZ2VVbml0IjoiTUIifX0.WonmqFXQ5qHbYZ9Y4L28VgLF8g9sF1xZqOTouJHw8YyRND18lkX2sKtfBxbK81KUXLpMeRV0VwOkqBbhDsbQH9zrPQz3wF1JyZxJoctJV9u1Fh3XI6CbKzctBd0weGWWD4hYNiX14cU5LvsmDx5QYRlfte6a4dL3NMOTcAiXWU3Pn7r0Ru1f9oiDKN8Waee5rKminMPqoupYGFI55i522J47UITq4TnJCHnfhsW9A2a-392EofFQ1WQSu64j8w_hlR8QL3BzhMfSIpamxLTy8wHlNUKJ36ZWfcBnudBEJGvJWfYSNZKEQu5eZfMZEYNs6phjIV1cxbFXBHO9phu9gw
+      LOCAL_RESTORE: "true"
+      
+      # Host configuration
+      HOST: http://localhost:8084
+      
+      # Feature flags
+      GORILLA_CSRF_SECURE: "false"
+      GORILLA_SESSION_SECURE: "false"
+    volumes:
+      - wandb-data:/vol
+    depends_on:
+      wandb-mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    networks:
+      - airflow-network
+
+  # ==================== RECOMMENDATION API WITH WANDB (NEW) ====================
+  
+  recommendation-api:
+    build:
+      context: ./recommendation
+      dockerfile: Dockerfile
+    container_name: recommendation-api
+    ports:
+      - "8000:8000"
+    environment:
+      # WandB connection (NEW)
+      WANDB_BASE_URL: http://wandb-server:8080
+      WANDB_API_KEY: 92ab8211f6a4c7db727b3333a1721fd9d4a1b457
+      
+      # Redis connection
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      
+      # PostgreSQL connection
+      DB_HOST: source-postgres
+      DB_PORT: 5432
+      DB_NAME: ecommerce
+      DB_USER: app_user
+      DB_PASSWORD: app_password
+      
+      # MinIO connection
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://minio:9000
+      
+      # API settings
+      MODEL_NAME: collaborative_filtering_model
+      MODEL_ALIAS: production
+      CACHE_TTL: 86400
+      LOG_LEVEL: INFO
+    volumes:
+      - ./recommendation:/app
+    depends_on:
+      wandb-server:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      source-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - airflow-network
+    restart: always
+volumes:
+  airflow-postgres-db:
+  source-postgres-db:
+  minio-data:
+  flink-checkpoints:
+  wandb-mysql-data:  # NEW
+  wandb-data: 
+
+networks:
+  airflow-network:
+    driver: bridge

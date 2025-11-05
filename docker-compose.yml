@@ -477,6 +477,7 @@ services:
       # WandB connection
       WANDB_BASE_URL: http://wandb-server:8080
       WANDB_API_KEY: ${WANDB_API_KEY}
+      WANDB_API_KEY: ${WANDB_API_KEY}
       
       # Redis connection
       REDIS_HOST: redis

@@ -23,11 +23,12 @@ Kiến trúc và dịch vụ
 
 Các thành phần code chính
 - Airflow DAGs (`dags/`):
-  - `medallion_pipeline.py`: ETL hằng ngày Postgres → MinIO (Bronze → Silver → Gold) với các bước:
-    - extract_from_postgres: đọc `orders` theo ngày, ghi Parquet vào bucket `bronze`.
-    - clean_orders: áp rule chất lượng dữ liệu (loại thiếu `order_id`, quantity <= 0, giá âm, chuẩn hóa `total`...), ghi `silver`.
-    - create_aggregations: tổng hợp `daily_summary`, `category_performance`, `regional_performance` vào `gold`.
-    - validate_pipeline: log thống kê, cảnh báo nếu tỉ lệ reject > 10%.
+  - `daily_pipeline.py` → DAG `medallion_ml_pipeline`: ETL hằng ngày Postgres → MinIO (Bronze → Silver → Gold) + ML training & evaluation + đăng ký model lên W&B:
+    - extract_from_postgres → clean_orders → create_aggregations
+    - prepare_ml_data: trích xuất tương tác user–product, tách train/eval (80/20), tích lũy eval set liên tục ở `gold/ml-data/...`
+    - train_model: huấn luyện CF (item-item) từ interactions, lưu artifact model vào MinIO
+    - evaluate_model: tính coverage/precision@10 trên eval set tích lũy
+    - register_to_wandb (điều kiện): lưu best model sang Weights & Biases Artifact Registry
   - `micro_batch_dashboard.py` (simple): mỗi ~phút chạy 3 task:
     - extract_today_metrics: lấy orders hôm nay từ Postgres, ghi `gold/dashboard/orders_today`.
     - compute_dashboard_metrics: tạo các bảng `overall_metrics`, `top_products`, `category_stats`, `regional_stats`, `hourly_stats` vào `gold/dashboard/metrics/*.parquet`.
@@ -46,6 +47,56 @@ Yêu cầu hệ thống
 - Docker, Docker Compose
 - Ports trống: 8080 (Airflow), 8081 (Trino UI), 8083 (Debezium), 8084 (W&B), 8501 (Dashboard), 9000/9001 (MinIO), 9092/9093 (Kafka), 9080 (Kafka UI), 6379 (Redis), 5433/5434 (Postgres), 3306 (MySQL)
 - Tùy chọn: tài khoản Telegram (BotFather) để nhận cảnh báo; W&B API key
+
+Sơ đồ pipeline tổng thể
+
+```mermaid
+flowchart LR
+  subgraph Source
+    PG[(PostgreSQL source)]
+  end
+
+  subgraph CDC/Streaming
+    ZK[Zookeeper]
+    KFK[Kafka]
+    DBZ[Debezium]
+    FL1[Flink Alert Detection]
+    FL2[Flink Telegram Sender]
+  end
+
+  subgraph Batch/ETL (Airflow)
+    DAG1[medallion_ml_pipeline\nBronze→Silver→Gold]
+    DAG2[micro_batch_dashboard_simple]
+  end
+
+  subgraph Lakehouse
+    MINIO[(MinIO S3\nbronze/silver/gold)]
+    TRINO[Trino]
+  end
+
+  subgraph Observability/Serving
+    DASH[Streamlit Dashboard]
+    REDIS[(Redis)]
+    WANDB[W&B Server]
+    RECSYS[Recommendation API]
+    TG[Telegram]
+  end
+
+  PG --> DBZ --> KFK
+  KFK --> FL1 -->|alerts| KFK
+  KFK --> FL2 --> TG
+
+  PG --> DAG1 --> MINIO
+  DAG2 --> MINIO
+  DAG2 -. pub/sub .-> REDIS
+  MINIO <--> TRINO
+  MINIO --> DASH
+  REDIS --> DASH
+
+  DAG1 -. register best model .-> WANDB
+  WANDB --> RECSYS
+  REDIS <--> RECSYS
+```
 
 Khởi chạy nhanh
 1) Clone repo và bật stack
@@ -113,7 +164,7 @@ docker exec flink-jobmanager /opt/flink/bin/flink run \
 ```
 
 Airflow DAGs
-- `medallion_postgres_minio_pipeline` (daily): bật trong Airflow UI.
+- `medallion_ml_pipeline` (daily + catchup): bật trong Airflow UI.
 - `micro_batch_dashboard_simple` (mặc định mỗi ~phút): bật để Dashboard tự cập nhật.
 
 Dashboard (Streamlit)
@@ -131,6 +182,19 @@ Recommendation API (FastAPI + W&B)
   - `GET /recommend/{customer_id}?top_n=` – gợi ý theo user (cache 24h ở Redis).
   - `GET /similar/{product_name}?top_n=` – sản phẩm tương tự.
   - `POST /reload` – reload model từ W&B, flush cache.
+- Ví dụ gọi nhanh:
+  - Kiểm tra health:
+    ```bash
+    curl http://localhost:8000/health
+    ```
+  - Gợi ý cho user 123 (Top-10):
+    ```bash
+    curl "http://localhost:8000/recommend/123?top_n=10"
+    ```
+  - Sản phẩm tương tự:
+    ```bash
+    curl "http://localhost:8000/similar/Widget%20A?top_n=10"
+    ```
 
 Dữ liệu và định dạng lưu trữ
 - Storage: Parquet trên MinIO (S3) tại các bucket `bronze`, `silver`, `gold`.

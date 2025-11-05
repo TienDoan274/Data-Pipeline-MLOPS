@@ -388,7 +388,7 @@ services:
       - airflow-network
     restart: always
   
-  # ==================== WANDB SELF-HOSTED STACK (NEW) ====================
+# ==================== WANDB SELF-HOSTED STACK (BASED ON OFFICIAL DOCS) ====================
   
   # WandB Database
   wandb-mysql:
@@ -412,42 +412,46 @@ services:
     restart: always
     networks:
       - airflow-network
-    command: --default-authentication-plugin=mysql_native_password
+    command: 
+      - --default-authentication-plugin=mysql_native_password
+      - --binlog_format=ROW
+      - --innodb_online_alter_log_max_size=268435456
+      - --sync_binlog=1
+      - --innodb_flush_log_at_trx_commit=1
+      - --binlog_row_image=MINIMAL
+      - --sort_buffer_size=67108864
 
-  # WandB Server
+  # WandB Server (CORRECTED - Using S3 connection string format from docs)
   wandb-server:
     image: wandb/local:latest
     container_name: wandb-server
     ports:
-      - "8084:8080"  # WandB UI (avoiding conflict with Airflow 8080)
+      - "8084:8080"
     environment:
-      # Database connection
+      # ===== DATABASE CONFIGURATION =====
       MYSQL_HOST: wandb-mysql
-      MYSQL_PORT: 3306
+      MYSQL_PORT: "3306"
       MYSQL_DATABASE: wandb_local
       MYSQL_USER: wandb
       MYSQL_PASSWORD: wandb_pass
       
-      # Storage backend (MinIO)
-      AWS_REGION: us-east-2
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
-      BUCKET: s3://wandb
-      BUCKET_QUEUE: internal://
+      # ===== STORAGE CONFIGURATION (S3 CONNECTION STRING FORMAT) =====
+      # According to docs: s3://$ACCESS_KEY:$SECRET_KEY@$HOST/$BUCKET_NAME
+      # For MinIO without TLS: s3://minioadmin:minioadmin@minio:9000/wandb
+      BUCKET: "s3://minioadmin:minioadmin@minio:9000/wandb"
       
-      # S3 endpoint (MinIO)
-      AWS_ENDPOINT_URL: http://minio:9000
-      
-      # WandB settings
-      LICENSE: eyJhbGciOiJSUzI1NiIsImtpZCI6InUzaHgyQjQyQWhEUXM1M0xQY09yNnZhaTdoSlduYnF1bTRZTlZWd1VwSWM9In0.eyJjb25jdXJyZW50QWdlbnRzIjoxMCwidHJpYWwiOnRydWUsIm1heFN0b3JhZ2VHYiI6MTAwMDAwMCwibWF4VGVhbXMiOjUwLCJtYXhVc2VycyI6MTAwLCJtYXhWaWV3T25seVVzZXJzIjowLCJtYXhSZWdpc3RlcmVkTW9kZWxzIjo1LCJleHBpcmVzQXQiOiIyMDI1LTExLTMwVDA0OjM0OjQ4LjYwOFoiLCJkZXBsb3ltZW50SWQiOiIxMmNmYWM5NC0wY2QwLTQ2Y2ItODQ4Zi00OWRhNzk3N2RhMDQiLCJmbGFncyI6WyJOT1RJRklDQVRJT05TIiwic2xhY2siLCJub3RpZmljYXRpb25zIiwiU0NBTEFCTEUiLCJteXNxbCIsInMzIiwicmVkaXMiLCJNQU5BR0VNRU5UIiwib3JnX2Rhc2giLCJhdXRoMCIsImNvbGxlY3RfYXVkaXRfbG9ncyIsInJiYWMiXSwiY29udHJhY3RTdGFydERhdGUiOiIyMDI1LTEwLTMxVDA0OjM0OjQ4LjYxM1oiLCJhY2Nlc3NLZXkiOiI1YTA2ZWFhYi05ZjgzLTRkYWMtOThhOC1jZmFmNDE5MGY3M2IiLCJzZWF0cyI6MTAwLCJ2aWV3T25seVNlYXRzIjowLCJ0ZWFtcyI6NTAsInJlZ2lzdGVyZWRNb2RlbHMiOjUsInN0b3JhZ2VHaWdzIjoxMDAwMDAwLCJleHAiOjE3NjQ0NzcyODgsIndlYXZlTGltaXRzIjp7IndlYXZlTGltaXRCeXRlcyI6bnVsbCwid2VhdmVPdmVyYWdlQ29zdENlbnRzIjowLCJ3ZWF2ZU92ZXJhZ2VVbml0IjoiTUIifX0.WonmqFXQ5qHbYZ9Y4L28VgLF8g9sF1xZqOTouJHw8YyRND18lkX2sKtfBxbK81KUXLpMeRV0VwOkqBbhDsbQH9zrPQz3wF1JyZxJoctJV9u1Fh3XI6CbKzctBd0weGWWD4hYNiX14cU5LvsmDx5QYRlfte6a4dL3NMOTcAiXWU3Pn7r0Ru1f9oiDKN8Waee5rKminMPqoupYGFI55i522J47UITq4TnJCHnfhsW9A2a-392EofFQ1WQSu64j8w_hlR8QL3BzhMfSIpamxLTy8wHlNUKJ36ZWfcBnudBEJGvJWfYSNZKEQu5eZfMZEYNs6phjIV1cxbFXBHO9phu9gw
+      # Set to internal:// for third-party object stores (per docs)
+      BUCKET_QUEUE: "internal://"
+      AWS_REGION: "us-east-1"
+      # ===== WANDB SETTINGS =====
+      LICENSE: ${WANDB_LICENSE}
       LOCAL_RESTORE: "true"
+      HOST: "http://localhost:8084"
       
-      # Host configuration
-      HOST: http://localhost:8084
-      
-      # Feature flags
+      # ===== SECURITY SETTINGS =====
       GORILLA_CSRF_SECURE: "false"
       GORILLA_SESSION_SECURE: "false"
+      
     volumes:
       - wandb-data:/vol
     depends_on:
@@ -455,17 +459,12 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
+    
     restart: always
     networks:
       - airflow-network
 
-  # ==================== RECOMMENDATION API WITH WANDB (NEW) ====================
+  # ==================== RECOMMENDATION API WITH WANDB ====================
   
   recommendation-api:
     build:
@@ -475,17 +474,17 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # WandB connection (NEW)
+      # WandB connection
       WANDB_BASE_URL: http://wandb-server:8080
-      WANDB_API_KEY: 92ab8211f6a4c7db727b3333a1721fd9d4a1b457
+      WANDB_API_KEY: ${WANDB_API_KEY}
       
       # Redis connection
       REDIS_HOST: redis
-      REDIS_PORT: 6379
+      REDIS_PORT: "6379"
       
       # PostgreSQL connection
       DB_HOST: source-postgres
-      DB_PORT: 5432
+      DB_PORT: "5432"
       DB_NAME: ecommerce
       DB_USER: app_user
       DB_PASSWORD: app_password
@@ -498,13 +497,12 @@ services:
       # API settings
       MODEL_NAME: collaborative_filtering_model
       MODEL_ALIAS: production
-      CACHE_TTL: 86400
+      CACHE_TTL: "86400"
       LOG_LEVEL: INFO
     volumes:
       - ./recommendation:/app
     depends_on:
-      wandb-server:
-        condition: service_healthy
+      
       redis:
         condition: service_healthy
       source-postgres:
@@ -518,13 +516,14 @@ services:
     networks:
       - airflow-network
     restart: always
+
 volumes:
   airflow-postgres-db:
   source-postgres-db:
   minio-data:
   flink-checkpoints:
-  wandb-mysql-data:  # NEW
-  wandb-data: 
+  wandb-mysql-data:
+  wandb-data:
 
 networks:
   airflow-network:

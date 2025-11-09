@@ -50,53 +50,8 @@ Yêu cầu hệ thống
 
 Sơ đồ pipeline tổng thể
 
-```mermaid
-flowchart LR
-  subgraph Source
-    PG[(PostgreSQL source)]
-  end
+<img width="3057" height="1799" alt="Untitled diagram-2025-11-09-050911" src="https://github.com/user-attachments/assets/72957b33-442e-4be6-87ea-b62ef8ccd600" />
 
-  subgraph CDC/Streaming
-    ZK[Zookeeper]
-    KFK[Kafka]
-    DBZ[Debezium]
-    FL1[Flink Alert Detection]
-    FL2[Flink Telegram Sender]
-  end
-
-  subgraph Batch/ETL (Airflow)
-    DAG1[medallion_ml_pipeline\nBronze→Silver→Gold]
-    DAG2[micro_batch_dashboard_simple]
-  end
-
-  subgraph Lakehouse
-    MINIO[(MinIO S3\nbronze/silver/gold)]
-    TRINO[Trino]
-  end
-
-  subgraph Observability/Serving
-    DASH[Streamlit Dashboard]
-    REDIS[(Redis)]
-    WANDB[W&B Server]
-    RECSYS[Recommendation API]
-    TG[Telegram]
-  end
-
-  PG --> DBZ --> KFK
-  KFK --> FL1 -->|alerts| KFK
-  KFK --> FL2 --> TG
-
-  PG --> DAG1 --> MINIO
-  DAG2 --> MINIO
-  DAG2 -. pub/sub .-> REDIS
-  MINIO <--> TRINO
-  MINIO --> DASH
-  REDIS --> DASH
-
-  DAG1 -. register best model .-> WANDB
-  WANDB --> RECSYS
-  REDIS <--> RECSYS
-```
 
 Khởi chạy nhanh
 1) Clone repo và bật stack

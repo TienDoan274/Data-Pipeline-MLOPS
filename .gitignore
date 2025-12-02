@@ -102,11 +102,6 @@ telegram_config.json
 *.onnx
 models/
 checkpoints/
-wandb/
-
-# WandB local data
-wandb-data/
-wandb-mysql-data/
 
 # ==================== MONITORING & TESTING ====================
 # Coverage reports

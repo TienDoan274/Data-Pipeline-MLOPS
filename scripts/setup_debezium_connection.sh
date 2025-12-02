@@ -48,7 +48,7 @@ RESPONSE=$(curl -s -X POST http://localhost:8083/connectors \
       "table.include.list": "public.orders",
       "plugin.name": "pgoutput",
       "publication.autocreate.mode": "filtered",
-      "slot.name": "debezium_orders_slot_v2",
+      "slot.name": "debezium_orders_slot_v3",
       "topic.prefix": "cdc",
       "heartbeat.interval.ms": "10000",
       "snapshot.mode": "initial",
@@ -62,7 +62,12 @@ RESPONSE=$(curl -s -X POST http://localhost:8083/connectors \
       "transforms": "unwrap",
       "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
       "transforms.unwrap.drop.tombstones": "true",
-      "transforms.unwrap.delete.handling.mode": "rewrite"
+      "transforms.unwrap.delete.handling.mode": "rewrite",
+      
+      "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+      "key.converter.schemas.enable": "false",
+      "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+      "value.converter.schemas.enable": "false"
     }
   }')
 

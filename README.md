@@ -113,9 +113,11 @@ TELEGRAM_CHAT_ID=your_chat_id
 Submit job:
 ```
 docker exec flink-jobmanager /opt/flink/bin/flink run \
-  -py -d /opt/flink/jobs/flink_job_telegram_sender.py \
+  -d \
+  -py /opt/flink/jobs/flink_job_telegram_sender.py \
   --bootstrap kafka:9092 \
   --topic flink-alerts
+
 ```
 
 Airflow DAGs

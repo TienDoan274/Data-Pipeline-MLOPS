@@ -1,5 +1,6 @@
 """
 Add 30 days of data starting from Nov 28, 2025
+Run: python scripts/add_30_days_data.py
 """
 import pandas as pd
 import numpy as np
@@ -350,7 +351,7 @@ def main():
         logger.info("✅ Connected to database\n")
         
         # Start date
-        start_date = datetime(2025, 11, 28, 0, 0, 0)
+        start_date = datetime(2025, 12, 2, 0, 0, 0)
         
         # Generate orders
         orders_df = generate_orders_30_days(start_date, engine, orders_per_day=150)

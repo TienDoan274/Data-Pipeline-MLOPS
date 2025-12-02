@@ -3,7 +3,9 @@ version: '3.8'
 
 x-airflow-common:
   &airflow-common
-  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.9.2}
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -131,8 +133,8 @@ services:
     command:
       - -c
       - |
-        mkdir -p /sources/logs /sources/dags /sources/plugins
-        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/ml /sources/models
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins,ml,models}
         exec su airflow -c "/entrypoint airflow version"
     environment:
       <<: *airflow-common-env
@@ -140,7 +142,6 @@ services:
       _AIRFLOW_WWW_USER_CREATE: 'true'
       _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
       _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
-      _PIP_ADDITIONAL_REQUIREMENTS: 'boto3 s3fs sqlalchemy psycopg2-binary pyarrow pandas'
     user: "0:0"
     volumes:
       - ${AIRFLOW_PROJ_DIR:-.}:/sources
@@ -388,83 +389,90 @@ services:
       - airflow-network
     restart: always
   
-# ==================== WANDB SELF-HOSTED STACK (BASED ON OFFICIAL DOCS) ====================
+# ==================== MLFLOW TRACKING SERVER ====================
   
-  # WandB Database
-  wandb-mysql:
-    image: mysql:8.0
-    container_name: wandb-mysql
+  # MLflow PostgreSQL Database
+  mlflow-postgres:
+    image: postgres:13
+    container_name: mlflow-postgres
     environment:
-      MYSQL_ROOT_PASSWORD: wandb_root_pass
-      MYSQL_DATABASE: wandb_local
-      MYSQL_USER: wandb
-      MYSQL_PASSWORD: wandb_pass
+      POSTGRES_USER: mlflow_user
+      POSTGRES_PASSWORD: mlflow_pass
+      POSTGRES_DB: mlflow_db
     volumes:
-      - wandb-mysql-data:/var/lib/mysql
+      - mlflow-postgres-data:/var/lib/postgresql/data
     ports:
-      - "3306:3306"
+      - "5431:5432"  # Different port to avoid conflict with source-postgres
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "wandb", "-pwandb_pass"]
+      test: ["CMD", "pg_isready", "-U", "mlflow_user", "-d", "mlflow_db"]
       interval: 10s
       timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: always
+    networks:
+      - airflow-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # MLflow Tracking Server
+  mlflow-server:
+    build:
+      context: ./mlflow
+    container_name: mlflow-server
+    ports:
+      - "5000:5000"
+    environment:
+      # Database backend (PostgreSQL)
+      MLFLOW_BACKEND_STORE_URI: postgresql://mlflow_user:mlflow_pass@mlflow-postgres:5432/mlflow_db
+      
+      # Artifact storage (MinIO S3)
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      
+      # Server settings
+      MLFLOW_SERVE_ARTIFACTS: "true"
+      MLFLOW_ARTIFACTS_DESTINATION: s3://mlflow
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://mlflow_user:mlflow_pass@mlflow-postgres:5432/mlflow_db
+      --default-artifact-root s3://mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+      --serve-artifacts
+    volumes:
+      - mlflow-data:/mlflow
+    depends_on:
+      mlflow-postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
       retries: 5
       start_period: 30s
     restart: always
     networks:
       - airflow-network
-    command: 
-      - --default-authentication-plugin=mysql_native_password
-      - --binlog_format=ROW
-      - --innodb_online_alter_log_max_size=268435456
-      - --sync_binlog=1
-      - --innodb_flush_log_at_trx_commit=1
-      - --binlog_row_image=MINIMAL
-      - --sort_buffer_size=67108864
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
 
-  # WandB Server (CORRECTED - Using S3 connection string format from docs)
-  wandb-server:
-    image: wandb/local:latest
-    container_name: wandb-server
-    ports:
-      - "8084:8080"
-    environment:
-      # ===== DATABASE CONFIGURATION =====
-      MYSQL_HOST: wandb-mysql
-      MYSQL_PORT: "3306"
-      MYSQL_DATABASE: wandb_local
-      MYSQL_USER: wandb
-      MYSQL_PASSWORD: wandb_pass
-      
-      # ===== STORAGE CONFIGURATION (S3 CONNECTION STRING FORMAT) =====
-      # According to docs: s3://$ACCESS_KEY:$SECRET_KEY@$HOST/$BUCKET_NAME
-      # For MinIO without TLS: s3://minioadmin:minioadmin@minio:9000/wandb
-      BUCKET: "s3://minioadmin:minioadmin@minio:9000/wandb"
-      
-      # Set to internal:// for third-party object stores (per docs)
-      BUCKET_QUEUE: "internal://"
-      AWS_REGION: "us-east-1"
-      # ===== WANDB SETTINGS =====
-      LICENSE: ${WANDB_LICENSE}
-      LOCAL_RESTORE: "true"
-      HOST: "http://localhost:8084"
-      
-      # ===== SECURITY SETTINGS =====
-      GORILLA_CSRF_SECURE: "false"
-      GORILLA_SESSION_SECURE: "false"
-      
-    volumes:
-      - wandb-data:/vol
-    depends_on:
-      wandb-mysql:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-    
-    restart: always
-    networks:
-      - airflow-network
-
-  # ==================== RECOMMENDATION API WITH WANDB ====================
+  # ==================== RECOMMENDATION API WITH MLFLOW ====================
   
   recommendation-api:
     build:
@@ -474,10 +482,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # WandB connection
-      WANDB_BASE_URL: http://wandb-server:8080
-      WANDB_API_KEY: ${WANDB_API_KEY}
-      WANDB_API_KEY: ${WANDB_API_KEY}
+      # MLflow connection
+      MLFLOW_TRACKING_URI: http://mlflow-server:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
       
       # Redis connection
       REDIS_HOST: redis
@@ -490,20 +499,14 @@ services:
       DB_USER: app_user
       DB_PASSWORD: app_password
       
-      # MinIO connection
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
-      AWS_ENDPOINT_URL: http://minio:9000
-      
       # API settings
       MODEL_NAME: collaborative_filtering_model
-      MODEL_ALIAS: production
+      MODEL_STAGE: Production  # MLflow uses stages: None, Staging, Production, Archived
       CACHE_TTL: "86400"
       LOG_LEVEL: INFO
     volumes:
       - ./recommendation:/app
     depends_on:
-      
       redis:
         condition: service_healthy
       source-postgres:
@@ -518,13 +521,14 @@ services:
       - airflow-network
     restart: always
 
+
 volumes:
   airflow-postgres-db:
   source-postgres-db:
   minio-data:
   flink-checkpoints:
-  wandb-mysql-data:
-  wandb-data:
+  mlflow-postgres-data: 
+  mlflow-data:
 
 networks:
   airflow-network:
